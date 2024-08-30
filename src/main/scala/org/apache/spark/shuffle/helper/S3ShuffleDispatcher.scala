@@ -45,10 +45,16 @@ class S3ShuffleDispatcher extends Logging {
   } else {
     fallbackStoragePath_.getOrElse(s"${STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH} is not set.")
   }
+  val rootPrefix: String = conf.get("spark.shuffle.s3.rootDirPrefix", defaultValue = "spark_shuffle_")
   private val rootDir_ =
     if (useSparkShuffleFetch) fallbackStoragePath
     else conf.get("spark.shuffle.s3.rootDir", defaultValue = "sparkS3shuffle/")
-  val rootDir: String = if (rootDir_.endsWith("/")) rootDir_ else rootDir_ + "/"
+  val rootDir: String = if (rootDir_.endsWith("/")) {
+    rootDir_
+  } else
+    {
+      rootDir_ + "/"
+    } + rootPrefix
   val rootIsLocal: Boolean = URI.create(rootDir).getScheme == "file"
 
   // Optional
