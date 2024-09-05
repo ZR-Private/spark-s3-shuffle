@@ -6,7 +6,7 @@
 scalaVersion := sys.env.getOrElse("SCALA_VERSION", "2.12.15")
 organization := "com.ibm"
 name := "spark-s3-shuffle"
-val sparkVersion = sys.env.getOrElse("SPARK_VERSION", "3.3.1")
+val sparkVersion = sys.env.getOrElse("SPARK_VERSION", "3.5.1")
 
 enablePlugins(GitVersioning, BuildInfoPlugin)
 
@@ -49,7 +49,7 @@ javaOptions ++= Seq("-Xms512M", "-Xmx2048M", "-XX:MaxPermSize=2048M", "-XX:+CMSC
 scalacOptions ++= Seq("-deprecation", "-unchecked")
 
 artifactName := { (sv: ScalaVersion, module: ModuleID, artifact: Artifact) =>
-  artifact.name + "_" + sv.binary + "-" + sparkVersion + "_" + module.revision + "." + artifact.extension
+  artifact.name + "_" + sv.binary + "-" + sparkVersion + "." + artifact.extension
 }
 
 assemblyMergeStrategy := {

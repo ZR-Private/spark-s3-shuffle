@@ -37,24 +37,14 @@ class S3ShuffleDispatcher extends Logging {
 
   // Required
   val useSparkShuffleFetch: Boolean = conf.getBoolean("spark.shuffle.s3.useSparkShuffleFetch", defaultValue = false)
-  private val fallbackStoragePath_ = conf.get(STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH)
-  val fallbackStoragePath = if (fallbackStoragePath_.isEmpty && useSparkShuffleFetch) {
-    throw new SparkException(
-      s"spark.shuffle.s3.useSparkShuffleFetch is set, but no ${STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH}"
-    )
-  } else {
-    fallbackStoragePath_.getOrElse(s"${STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH} is not set.")
-  }
-  val rootPrefix: String = conf.get("spark.shuffle.s3.rootDirPrefix", defaultValue = "spark_shuffle_")
-  private val rootDir_ =
-    if (useSparkShuffleFetch) fallbackStoragePath
-    else conf.get("spark.shuffle.s3.rootDir", defaultValue = "sparkS3shuffle/")
-  val rootDir: String = if (rootDir_.endsWith("/")) {
+  private val rootPrefix: String = conf.get("spark.shuffle.s3.rootDirPrefix", defaultValue = "spark_shuffle_")
+  private val rootDir_ = conf.get("spark.shuffle.s3.rootDir", defaultValue = "sparkS3shuffle/")
+  private val rootDirEndsSlash = if (rootDir_.endsWith("/")) {
     rootDir_
-  } else
-    {
-      rootDir_ + "/"
-    } + rootPrefix
+  } else {
+    rootDir_ + "/"
+  }
+  val rootDir: String = rootDirEndsSlash + rootPrefix
   val rootIsLocal: Boolean = URI.create(rootDir).getScheme == "file"
 
   // Optional
@@ -70,6 +60,7 @@ class S3ShuffleDispatcher extends Logging {
   val alwaysCreateIndex: Boolean = conf.getBoolean("spark.shuffle.s3.alwaysCreateIndex", defaultValue = false)
   val useBlockManager: Boolean = conf.getBoolean("spark.shuffle.s3.useBlockManager", defaultValue = true)
   val forceBatchFetch: Boolean = conf.getBoolean("spark.shuffle.s3.forceBatchFetch", defaultValue = false)
+  val tempDir: String = conf.get("spark.shuffle.s3.tempDir", defaultValue = "/tmp/")
 
   // Spark feature
   val checksumAlgorithm: String = SparkEnv.get.conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM)
@@ -85,9 +76,6 @@ class S3ShuffleDispatcher extends Logging {
 
   // Required
   logInfo(s"- spark.shuffle.s3.rootDir=${rootDir} (appId: ${appId})")
-  if (useSparkShuffleFetch) {
-    logInfo(s"  ${STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH} is used as storage location.")
-  }
   // Optional
   logInfo(s"- spark.shuffle.s3.useSparkShuffleFetch=${useSparkShuffleFetch}")
   logInfo(s"- spark.shuffle.s3.bufferSize=${bufferSize}")
@@ -135,18 +123,23 @@ class S3ShuffleDispatcher extends Logging {
         (shuffleId, mapId)
       case _ => (0, 0.toLong)
     }
-    if (useSparkShuffleFetch) {
-      blockId match {
-        case ShuffleDataBlockId(_, _, _)     =>
-        case ShuffleIndexBlockId(_, _, _)    =>
-        case ShuffleChecksumBlockId(_, _, _) =>
-        case _                               => throw new SparkException(s"Unsupported block id type: ${blockId.name}")
-      }
-      val hash = JavaUtils.nonNegativeHash(blockId.name)
-      return new Path(f"${rootDir}${appId}/${shuffleId}/${hash}/${blockId.name}")
-    }
     val idx = mapId % folderPrefixes
     new Path(f"${rootDir}${idx}/${appId}/${shuffleId}/${blockId.name}")
+  }
+
+  def getSubPath(blockId: BlockId): String = {
+    val shuffleId = blockId match {
+      case ShuffleBlockId(shuffleId, _, _) =>
+        shuffleId
+      case ShuffleDataBlockId(shuffleId, _, _) =>
+        shuffleId
+      case ShuffleIndexBlockId(shuffleId, _, _) =>
+        shuffleId
+      case ShuffleChecksumBlockId(shuffleId, _, _) =>
+        shuffleId
+      case _ => 0
+    }
+    f"${appId}/${shuffleId}/${blockId.name}"
   }
 
   def listShuffleIndices(shuffleId: Int): Array[ShuffleIndexBlockId] = {
@@ -235,6 +228,7 @@ class S3ShuffleDispatcher extends Logging {
         case TempLocalBlockId(_)                           => false
         case TempShuffleBlockId(_)                         => false
         case TestBlockId(_)                                => false
+        case _                                             => false
       }
     cachedFileStatus.remove(filter, _)
   }
