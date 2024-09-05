@@ -149,6 +149,11 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
     */
   private[this] val fetchRequests = new Queue[FetchRequest]
 
+  /** Queue of fetch requests to issue; we'll pull requests off this gradually to make sure that the number of bytes in
+    * flight is limited to maxBytesInFlight.
+    */
+  private[this] val fallbackFetchRequests = new Queue[FallbackFetchRequest]
+
   /** Queue of fetch requests which could not be issued the first time they were dequeued. These requests are tried
     * again when the fetch constraints are satisfied.
     */
@@ -156,6 +161,9 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
 
   /** Current bytes in flight from our requests */
   private[this] var bytesInFlight = 0L
+
+  /** Current bytes in flight from our requests */
+  private[this] var fallbackBytesInFlight = 0L
 
   /** Current number of requests in flight */
   private[this] var reqsInFlight = 0
@@ -407,7 +415,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
   private[this] def partitionBlocksByFetchMode(
       blocksByAddress: Iterator[(BlockManagerId, collection.Seq[(BlockId, Long, Int)])],
       localBlocks: mutable.LinkedHashSet[(BlockId, Int)],
-      fallbackBlocks: mutable.LinkedHashSet[(BlockId, Int)],
+      fallbackBlocks: mutable.LinkedHashSet[(BlockId, Long, Int)],
       hostLocalBlocksByExecutor: mutable.LinkedHashMap[BlockManagerId, collection.Seq[(BlockId, Long, Int)]],
       pushMergedLocalBlocks: mutable.LinkedHashSet[BlockId]
   ): ArrayBuffer[FetchRequest] = {
@@ -446,7 +454,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
         )
         numBlocksToFetch += mergedBlockInfos.size
         if (address == FallbackStorage.FALLBACK_BLOCK_MANAGER_ID) {
-          fallbackBlocks ++= mergedBlockInfos.map(info => (info.blockId, info.mapIndex))
+          fallbackBlocks ++= mergedBlockInfos.map(info => (info.blockId, info.size, info.mapIndex))
         } else {
           localBlocks ++= mergedBlockInfos.map(info => (info.blockId, info.mapIndex))
         }
@@ -762,7 +770,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
     context.addTaskCompletionListener(onCompleteCallback)
     // Local blocks to fetch, excluding zero-sized blocks.
     val localBlocks = mutable.LinkedHashSet[(BlockId, Int)]()
-    val fallbackBlocks = mutable.LinkedHashSet[(BlockId, Int)]()
+    val fallbackBlocks = mutable.LinkedHashSet[(BlockId, Long, Int)]()
     val hostLocalBlocksByExecutor =
       mutable.LinkedHashMap[BlockManagerId, collection.Seq[(BlockId, Long, Int)]]()
     val pushMergedLocalBlocks = mutable.LinkedHashSet[BlockId]()
@@ -796,6 +804,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
     // Get Local Blocks
     fetchLocalBlocks(localBlocks)
     enqueueLocalStorageFetch(fallbackBlocks.toSeq)
+    fetchFallbackUpToMaxBytes()
     logDebug(s"Got local blocks in ${Utils.getUsedTimeNs(startTimeNs)}")
     // Get host local blocks if any
     fetchAllHostLocalBlocks(hostLocalBlocksByExecutor)
@@ -810,9 +819,9 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
     }
   }
 
-  private[this] def enqueueLocalStorageFetch(localBlocks: Seq[(BlockId, Int)]): Unit = {
+  private[this] def enqueueLocalStorageFetch(localBlocks: Seq[(BlockId, Long, Int)]): Unit = {
     val mapped = localBlocks
-      .map { case (blockId, mapIndex) =>
+      .map { case (blockId, size, mapIndex) =>
         val (shuffleId, mapId) = blockId match {
           case id: ShuffleBlockId =>
             (id.shuffleId, id.mapId)
@@ -821,42 +830,58 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
           case _ =>
             throw SparkException.internalError(s"unexpected shuffle block id format: $blockId", category = "STORAGE")
         }
-        ((shuffleId, mapId), (blockId, mapIndex))
+        ((shuffleId, mapId), (blockId, size, mapIndex))
       }
       .groupBy(_._1)
+      .map { case ((shuffleId, mapId), blocks) =>
+        val fetchBlocks = blocks.map { case ((_, _), (blockId, size, mapIndex)) =>
+          FetchBlockInfo(blockId, size, mapIndex)
+        }
+        FallbackFetchRequest(shuffleId = shuffleId, mapId = mapId, blocks = fetchBlocks)
+      }
+    fallbackFetchRequests ++= mapped
+  }
 
-    mapped.foreach { case ((shuffleId, mapId), blocks) =>
-      val runnable = new Runnable {
-        override def run(): Unit = {
-          try {
-            logDebug(s"fetching fallback storage block: ${shuffleId} ${mapId}")
-            val lock = lockCache.get(s"${shuffleId}@${mapId}")
-            lock.synchronized {
-              S3FallbackStorage.downloadFiles(shuffleId, mapId)
-            }
-            blocks.foreach { case ((_, _), (blockId, mapIndex)) =>
-              val buf = S3FallbackStorage.readFromLocal(blockId)
-              shuffleMetrics.incLocalBlocksFetched(1)
-              shuffleMetrics.incLocalBytesRead(buf.size)
-              buf.retain()
-              results.put(SuccessFetchResult(blockId, mapIndex, blockManager.blockManagerId, buf.size(), buf, false))
-            }
-          } catch {
-            case e: Exception =>
-              logError("Error occurred while fetching fallback storage blocks", e)
-              try {
-                blocks.foreach { case ((_, _), (blockId, mapIndex)) =>
-                  results.put(FailureFetchResult(blockId, mapIndex, blockManager.blockManagerId, e))
-                }
-              } catch {
-                case e: InterruptedException =>
-                  logWarning(s"results interrupted", e)
+  private[this] def fetchFallbackUpToMaxBytes(): Unit = {
+    if (fallbackBytesInFlight < maxBytesInFlight) {
+      while (fallbackFetchRequests.nonEmpty && fallbackBytesInFlight < maxBytesInFlight) {
+        val head = fallbackFetchRequests.dequeue()
+        fallbackBytesInFlight += head.size
+        logDebug(s"enqueuing head ${head} size ${head.size} fallbackBytesInFlight ${fallbackBytesInFlight}")
+        val runnable = new Runnable {
+          override def run(): Unit = {
+            try {
+              logDebug(s"fetching fallback storage block: ${head.shuffleId} ${head.mapId}")
+              val lock = lockCache.get(s"${head.shuffleId}@${head.mapId}")
+              lock.synchronized {
+                S3FallbackStorage.downloadFiles(head.shuffleId, head.mapId)
               }
-
+              head.blocks.foreach { case FetchBlockInfo(blockId, size, mapIndex) =>
+                val buf = S3FallbackStorage.readFromLocal(blockId)
+                shuffleMetrics.incLocalBlocksFetched(1)
+                shuffleMetrics.incLocalBytesRead(buf.size)
+                buf.retain()
+                results.put(
+                  SuccessFetchResult(blockId, mapIndex, FallbackStorage.FALLBACK_BLOCK_MANAGER_ID, size, buf, false)
+                )
+              }
+            } catch {
+              case e: Exception =>
+                logError("Error occurred while fetching fallback storage blocks", e)
+                try {
+                  head.blocks.foreach { case FetchBlockInfo(blockId, _, mapIndex) =>
+                    results.put(FailureFetchResult(blockId, mapIndex, FallbackStorage.FALLBACK_BLOCK_MANAGER_ID, e))
+                  }
+                } catch {
+                  case e: InterruptedException =>
+                    logWarning(s"results interrupted", e)
+                }
+            }
           }
         }
+        fallbackStorageExecutorsService.execute(runnable)
       }
-      fallbackStorageExecutorsService.execute(runnable)
+      logDebug("end loop")
     }
   }
 
@@ -931,7 +956,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
 
       result match {
         case SuccessFetchResult(blockId, mapIndex, address, size, buf, isNetworkReqDone) =>
-          if (address != blockManager.blockManagerId) {
+          if (address != blockManager.blockManagerId && address != FallbackStorage.FALLBACK_BLOCK_MANAGER_ID) {
             if (
               hostLocalBlocks.contains(blockId -> mapIndex) ||
               pushBasedFetchHelper.isLocalPushMergedBlockAddress(address)
@@ -948,6 +973,11 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
             reqsInFlight -= 1
             resetNettyOOMFlagIfPossible(maxReqSizeShuffleToMem)
             logDebug("Number of requests in flight " + reqsInFlight)
+          }
+          logDebug(s"address ${address} equal ${address == FallbackStorage.FALLBACK_BLOCK_MANAGER_ID}")
+          if (address == FallbackStorage.FALLBACK_BLOCK_MANAGER_ID) {
+            fallbackBytesInFlight -= size
+            logDebug(s"fallbackBytesInFlight: ${fallbackBytesInFlight}")
           }
 
           val in = if (buf.size == 0) {
@@ -1200,6 +1230,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
 
       // Send fetch requests up to maxBytesInFlight
       fetchUpToMaxBytes()
+      fetchFallbackUpToMaxBytes()
     }
 
     currentResult = result.asInstanceOf[SuccessFetchResult]
@@ -1416,7 +1447,7 @@ private[spark] final class S3ShuffleBlockFetcherIterator(
       originalBlocksByAddr: Iterator[(BlockManagerId, collection.Seq[(BlockId, Long, Int)])]
   ): Unit = {
     val originalLocalBlocks = mutable.LinkedHashSet[(BlockId, Int)]()
-    val originalFallbackBlocks = mutable.LinkedHashSet[(BlockId, Int)]()
+    val originalFallbackBlocks = mutable.LinkedHashSet[(BlockId, Long, Int)]()
     val originalHostLocalBlocksByExecutor =
       mutable.LinkedHashMap[BlockManagerId, collection.Seq[(BlockId, Long, Int)]]()
     val originalMergedLocalBlocks = mutable.LinkedHashSet[BlockId]()
@@ -1699,6 +1730,14 @@ private[storage] object S3ShuffleBlockFetcherIterator {
       address: BlockManagerId,
       blocks: collection.Seq[FetchBlockInfo],
       forMergedMetas: Boolean = false
+  ) {
+    val size = blocks.map(_.size).sum
+  }
+
+  case class FallbackFetchRequest(
+      shuffleId: Int,
+      mapId: Long,
+      blocks: collection.Seq[FetchBlockInfo]
   ) {
     val size = blocks.map(_.size).sum
   }
