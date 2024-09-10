@@ -37,14 +37,18 @@ class S3ShuffleDispatcher extends Logging {
 
   // Required
   val useSparkShuffleFetch: Boolean = conf.getBoolean("spark.shuffle.s3.useSparkShuffleFetch", defaultValue = false)
-  private val rootPrefix: String = conf.get("spark.shuffle.s3.rootDirPrefix", defaultValue = "spark_shuffle_")
+  private val appPrefix_ = conf.get("spark.shuffle.s3.rootDirPrefix", defaultValue = "app")
+  val appPrefix = if (appPrefix_.endsWith("/")) {
+    appPrefix_.substring(0, appPrefix_.length - 1)
+  } else {
+    appPrefix_
+  }
   private val rootDir_ = conf.get("spark.shuffle.s3.rootDir", defaultValue = "sparkS3shuffle/")
-  private val rootDirEndsSlash = if (rootDir_.endsWith("/")) {
+  val rootDir: String = if (rootDir_.endsWith("/")) {
     rootDir_
   } else {
     rootDir_ + "/"
   }
-  val rootDir: String = rootDirEndsSlash + rootPrefix
   val rootIsLocal: Boolean = URI.create(rootDir).getScheme == "file"
 
   // Optional
@@ -99,7 +103,7 @@ class S3ShuffleDispatcher extends Logging {
     Range(0, folderPrefixes)
       .map(idx => {
         Future {
-          val prefix = f"${rootDir}${idx}/${appId}"
+          val prefix = f"${rootDir}${idx}/${appPrefix}/${appId}"
           try {
             fs.delete(new Path(prefix), true)
           } catch {
@@ -124,7 +128,7 @@ class S3ShuffleDispatcher extends Logging {
       case _ => (0, 0.toLong)
     }
     val idx = mapId % folderPrefixes
-    new Path(f"${rootDir}${idx}/${appId}/${shuffleId}/${blockId.name}")
+    new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/${blockId.name}")
   }
 
   def getSubPath(blockId: BlockId): String = {
@@ -139,7 +143,7 @@ class S3ShuffleDispatcher extends Logging {
         shuffleId
       case _ => 0
     }
-    f"${appId}/${shuffleId}/${blockId.name}"
+    f"${appPrefix}/${appId}/${shuffleId}/${blockId.name}"
   }
 
   def listShuffleIndices(shuffleId: Int): Array[ShuffleIndexBlockId] = {
@@ -155,7 +159,7 @@ class S3ShuffleDispatcher extends Logging {
     Range(0, folderPrefixes)
       .map(idx => {
         Future {
-          val path = new Path(f"${rootDir}${idx}/${appId}/${shuffleId}/")
+          val path = new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/")
           try {
             fs.listStatus(path, shuffleIndexFilter)
               .map(v => {
@@ -173,7 +177,7 @@ class S3ShuffleDispatcher extends Logging {
   def removeShuffle(shuffleId: Int): Unit = {
     Range(0, folderPrefixes)
       .map(idx => {
-        val path = new Path(f"${rootDir}${idx}/${appId}/${shuffleId}/")
+        val path = new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/")
         Future {
           fs.delete(path, true)
         }
