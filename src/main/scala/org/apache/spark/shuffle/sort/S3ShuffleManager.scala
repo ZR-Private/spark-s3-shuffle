@@ -93,7 +93,7 @@ private[spark] class S3ShuffleManager(conf: SparkConf) extends ShuffleManager wi
         endPartition
       )
       val canEnableBatchFetch = true
-      return new S3BlockStoreShuffleReader(
+      return new BlockStoreShuffleReader(
         handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
         blocksByAddress,
         context,
