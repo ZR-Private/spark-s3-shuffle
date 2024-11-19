@@ -5,11 +5,10 @@
 
 package org.apache.spark.shuffle.helper
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.internal.config.STORAGE_DECOMMISSION_FALLBACK_STORAGE_PATH
 import org.apache.spark.internal.{Logging, config}
-import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.shuffle.ConcurrentObjectMap
 import org.apache.spark.storage._
 import org.apache.spark.{SparkConf, SparkEnv, SparkException}
@@ -26,6 +25,8 @@ class S3ShuffleDispatcher extends Logging {
   val executorId: String = SparkEnv.get.executorId
   val conf: SparkConf = SparkEnv.get.conf
   private var appId: String = conf.getAppId
+  private val SPARK_S3_SHUFFLE_REGULAR_HADOOP_PREFIX = "spark.shuffle.s3.regular.hadoop."
+  private val SPARK_S3_SHUFFLE_RANDOM_HADOOP_PREFIX = "spark.shuffle.s3.random.hadoop."
 
   def reinitialize(newAppId: String): Unit = {
     appId = newAppId
@@ -70,13 +71,18 @@ class S3ShuffleDispatcher extends Logging {
   val checksumAlgorithm: String = SparkEnv.get.conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM)
   val checksumEnabled: Boolean = SparkEnv.get.conf.get(config.SHUFFLE_CHECKSUM_ENABLED)
 
-  val fs: FileSystem = FileSystem.get(
-    URI.create(rootDir), {
-      SparkHadoopUtil.newConfiguration(conf)
-    }
+  val fs: FileSystem = FileSystem.newInstance(
+    URI.create(rootDir),
+    getHadoopConfForFileSystem(SPARK_S3_SHUFFLE_REGULAR_HADOOP_PREFIX)
+  )
+
+  val randomFs: FileSystem = FileSystem.newInstance(
+    URI.create(rootDir),
+    getHadoopConfForFileSystem(SPARK_S3_SHUFFLE_RANDOM_HADOOP_PREFIX)
   )
 
   val canSetReadahead = fs.hasPathCapability(new Path(rootDir), StreamCapabilities.READAHEAD)
+  val prefixKeys: Array[Char] = (('0' to '9') ++ ('a' to 'z') ++ ('A' to 'Z')).toArray
 
   // Required
   logInfo(s"- spark.shuffle.s3.rootDir=${rootDir} (appId: ${appId})")
@@ -99,11 +105,20 @@ class S3ShuffleDispatcher extends Logging {
   logInfo(s"- ${config.SHUFFLE_CHECKSUM_ALGORITHM.key}=${checksumAlgorithm}")
   logInfo(s"- ${config.SHUFFLE_CHECKSUM_ENABLED.key}=${checksumEnabled}")
 
+  private def getHadoopConfForFileSystem(prefix: String): Configuration = {
+    val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+    conf.getAllWithPrefix(prefix).foreach { case (key, value) =>
+      logInfo(s"setting ${key}=${value}")
+      hadoopConf.set(key, value)
+    }
+    hadoopConf
+  }
+
   def removeRoot(): Boolean = {
     Range(0, folderPrefixes)
       .map(idx => {
         Future {
-          val prefix = f"${rootDir}${idx}/${appPrefix}/${appId}"
+          val prefix = f"${rootDir}${prefixKeys(idx)}/${appPrefix}/${appId}"
           try {
             fs.delete(new Path(prefix), true)
           } catch {
@@ -128,7 +143,7 @@ class S3ShuffleDispatcher extends Logging {
       case _ => (0, 0.toLong)
     }
     val idx = mapId % folderPrefixes
-    new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/${blockId.name}")
+    new Path(f"${rootDir}${prefixKeys(idx.toInt)}/${appPrefix}/${appId}/${shuffleId}/${blockId.name}")
   }
 
   def getSubPath(blockId: BlockId): String = {
@@ -159,7 +174,7 @@ class S3ShuffleDispatcher extends Logging {
     Range(0, folderPrefixes)
       .map(idx => {
         Future {
-          val path = new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/")
+          val path = new Path(f"${rootDir}${prefixKeys(idx)}/${appPrefix}/${appId}/${shuffleId}/")
           try {
             fs.listStatus(path, shuffleIndexFilter)
               .map(v => {
@@ -177,7 +192,7 @@ class S3ShuffleDispatcher extends Logging {
   def removeShuffle(shuffleId: Int): Unit = {
     Range(0, folderPrefixes)
       .map(idx => {
-        val path = new Path(f"${rootDir}${idx}/${appPrefix}/${appId}/${shuffleId}/")
+        val path = new Path(f"${rootDir}${prefixKeys(idx)}/${appPrefix}/${appId}/${shuffleId}/")
         Future {
           fs.delete(path, true)
         }
