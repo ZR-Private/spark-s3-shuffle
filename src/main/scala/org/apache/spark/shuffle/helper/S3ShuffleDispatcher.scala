@@ -9,12 +9,16 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.{Logging, config}
+import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
 import org.apache.spark.shuffle.ConcurrentObjectMap
+import org.apache.spark.shuffle.IndexShuffleBlockResolver.NOOP_REDUCE_ID
 import org.apache.spark.storage._
+import org.apache.spark.util.Utils
 import org.apache.spark.{SparkConf, SparkEnv, SparkException}
 
 import java.io.IOException
 import java.net.URI
+import java.nio.ByteBuffer
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future}
@@ -258,7 +262,46 @@ class S3ShuffleDispatcher extends Logging {
     * @return
     */
   def createBlock(blockId: BlockId): FSDataOutputStream = {
-    fs.create(getPath(blockId))
+    fs.createFile(getPath(blockId)).opt("fs.s3a.create.performance", true).build()
+  }
+
+  def readFromLocal(blockId: BlockId): ManagedBuffer = {
+    logDebug(s"Read $blockId")
+
+    val (shuffleId, mapId, startReduceId, endReduceId) = blockId match {
+      case id: ShuffleBlockId =>
+        (id.shuffleId, id.mapId, id.reduceId, id.reduceId + 1)
+      case batchId: ShuffleBlockBatchId =>
+        (batchId.shuffleId, batchId.mapId, batchId.startReduceId, batchId.endReduceId)
+      case _ =>
+        throw SparkException.internalError(s"unexpected shuffle block id format: $blockId", category = "STORAGE")
+    }
+
+    val indexBlockId = ShuffleIndexBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
+    val indexData = S3ShuffleHelper.getPartitionLengths(indexBlockId)
+    val offset = indexData(startReduceId)
+    val size = indexData(endReduceId) - indexData(startReduceId)
+    val array = new Array[Byte](size.toInt)
+
+    val dataBlockId = ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
+    val dataFile = getPath(dataBlockId)
+    val dataFileFakeStatus = new FileStatus(Int.MaxValue, false, 0, 0, 0, dataFile)
+    Utils.tryWithResource(
+      randomFs
+        .openFile(dataFile)
+        .opt("fs.option.openfile.read.policy", "random")
+        .opt("fs.s3a.readahead.range", "0")
+        .withFileStatus(dataFileFakeStatus)
+        .build()
+        .get()
+    ) { dataStream =>
+      logDebug(s"To byte array $size")
+      val startTimeNs = System.nanoTime()
+      dataStream.seek(offset)
+      dataStream.readFully(array)
+      logDebug(s"Took ${(System.nanoTime() - startTimeNs) / (1000 * 1000)}ms")
+    }
+    new NioManagedBuffer(ByteBuffer.wrap(array))
   }
 }
 

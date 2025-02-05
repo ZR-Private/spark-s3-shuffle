@@ -1,12 +1,12 @@
 package org.apache.spark.shuffle.helper
 
-import org.apache.spark.{SparkException}
+import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle.ConcurrentObjectMap
 import org.apache.spark.shuffle.IndexShuffleBlockResolver.NOOP_REDUCE_ID
 import org.apache.spark.storage.{BlockId, ShuffleChecksumBlockId, ShuffleIndexBlockId}
 
-import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream}
+import java.io.{BufferedInputStream, DataInputStream}
 import java.util.zip.{Adler32, CRC32, Checksum}
 
 object S3ShuffleHelper extends Logging {
@@ -52,10 +52,8 @@ object S3ShuffleHelper extends Logging {
 
   def writeArrayAsBlock(blockId: BlockId, array: Array[Long]): Unit = {
     val file = dispatcher.createBlock(blockId)
-    val out = new DataOutputStream(new BufferedOutputStream(file, scala.math.min(8192, 8 * array.length)))
-    array.foreach(out.writeLong)
-    out.flush()
-    out.close()
+    array.foreach(file.writeLong)
+    file.close()
   }
 
   /** Get the cached partition length for shuffle index at shuffleId and mapId

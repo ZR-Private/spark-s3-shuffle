@@ -14,7 +14,7 @@ import org.apache.spark.shuffle.api.{ShuffleMapOutputWriter, ShufflePartitionWri
 import org.apache.spark.shuffle.helper.{S3ShuffleDispatcher, S3ShuffleHelper}
 import org.apache.spark.storage.ShuffleDataBlockId
 
-import java.io.{BufferedOutputStream, IOException, OutputStream}
+import java.io.{IOException, OutputStream}
 import java.nio.ByteBuffer
 import java.nio.channels.{Channels, WritableByteChannel}
 import java.util.Optional
@@ -36,22 +36,18 @@ class S3ShuffleMapOutputWriter(
   /* Target block for writing */
   private val shuffleBlock = ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
   private var stream: FSDataOutputStream = _
-  private var bufferedStream: OutputStream = _
-  private var bufferedStreamAsChannel: WritableByteChannel = _
-  private var reduceIdStreamPosition: Long = 0
+  private var streamAsChannel: WritableByteChannel = _
 
   def initStream(): Unit = {
     if (stream == null) {
       stream = dispatcher.createBlock(shuffleBlock)
-      bufferedStream =
-        new S3MeasureOutputStream(new BufferedOutputStream(stream, dispatcher.bufferSize), shuffleBlock.name)
     }
   }
 
   def initChannel(): Unit = {
-    if (bufferedStreamAsChannel == null) {
+    if (streamAsChannel == null) {
       initStream()
-      bufferedStreamAsChannel = Channels.newChannel(bufferedStream)
+      streamAsChannel = Channels.newChannel(stream)
     }
   }
 
@@ -71,13 +67,6 @@ class S3ShuffleMapOutputWriter(
     if (reducePartitionId >= numPartitions) {
       throw new RuntimeException("Precondition: Invalid partition id.")
     }
-    if (bufferedStream != null) {
-      bufferedStream.flush()
-    }
-    if (stream != null) {
-      stream.flush()
-      reduceIdStreamPosition = stream.getPos
-    }
     lastPartitionWriterId = reducePartitionId
     new S3ShufflePartitionWriter(reducePartitionId)
   }
@@ -89,9 +78,6 @@ class S3ShuffleMapOutputWriter(
     * @return
     */
   override def commitAllPartitions(checksums: Array[Long]): MapOutputCommitMessage = {
-    if (bufferedStream != null) {
-      bufferedStream.flush()
-    }
     if (stream != null) {
       if (stream.getPos != totalBytesWritten) {
         throw new RuntimeException(
@@ -99,12 +85,12 @@ class S3ShuffleMapOutputWriter(
         )
       }
     }
-    if (bufferedStreamAsChannel != null) {
-      bufferedStreamAsChannel.close()
+    if (streamAsChannel != null) {
+      streamAsChannel.close()
     }
-    if (bufferedStream != null) {
+    if (stream != null) {
       // Closes the underlying stream as well!
-      bufferedStream.close()
+      stream.close()
     }
 
     // Write index and checksum.
@@ -122,11 +108,8 @@ class S3ShuffleMapOutputWriter(
   }
 
   private def cleanUp(): Unit = {
-    if (bufferedStreamAsChannel != null) {
-      bufferedStreamAsChannel.close()
-    }
-    if (bufferedStream != null) {
-      bufferedStream.close()
+    if (streamAsChannel != null) {
+      streamAsChannel.close()
     }
     if (stream != null) {
       stream.close()
@@ -175,7 +158,7 @@ class S3ShuffleMapOutputWriter(
       if (isClosed) {
         throw new IOException("S3ShuffleOutputStream is already closed.")
       }
-      bufferedStream.write(b)
+      stream.write(b)
       byteCount += 1
     }
 
@@ -183,7 +166,7 @@ class S3ShuffleMapOutputWriter(
       if (isClosed) {
         throw new IOException("S3ShuffleOutputStream is already closed.")
       }
-      bufferedStream.write(b, off, len)
+      stream.write(b, off, len)
       byteCount += len
     }
 
@@ -191,7 +174,7 @@ class S3ShuffleMapOutputWriter(
       if (isClosed) {
         throw new IOException("S3ShuffleOutputStream is already closed.")
       }
-      bufferedStream.flush()
+      stream.flush()
     }
 
     override def close(): Unit = {
@@ -202,7 +185,7 @@ class S3ShuffleMapOutputWriter(
   }
 
   private class S3ShufflePartitionWriterChannel(reduceId: Int) extends WritableByteChannelWrapper {
-    private val partChannel = new S3PartitionWritableByteChannel(bufferedStreamAsChannel)
+    private val partChannel = new S3PartitionWritableByteChannel(streamAsChannel)
 
     override def channel(): WritableByteChannel = {
       partChannel
