@@ -285,7 +285,7 @@ class S3ShuffleDispatcher extends Logging {
 
     val dataBlockId = ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
     val dataFile = getPath(dataBlockId)
-    val dataFileFakeStatus = new FileStatus(Int.MaxValue, false, 0, 0, 0, dataFile)
+    val dataFileFakeStatus = new FileStatus(Long.MaxValue, false, 0, 0, 0, dataFile)
     Utils.tryWithResource(
       randomFs
         .openFile(dataFile)
